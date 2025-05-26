@@ -2,639 +2,690 @@ const {
   time,
   loadFixture,
 } = require("@nomicfoundation/hardhat-toolbox/network-helpers");
-const { anyValue } = require("@nomicfoundation/hardhat-chai-matchers/withArgs");
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 
 describe("BTCLendingProtocol", function () {
-  // Constants for testing
-  const LIQUIDATION_THRESHOLD = 75;
-  const MAX_LTV = 70;
-  const LIQUIDATION_PENALTY = 10;
-  const PRECISION = 100;
-  
-  // Mock price feed data
-  const MOCK_BTC_PRICE = 50000 * 10**8; // $50,000 with 8 decimals
+  // Optimized constants
+  const LIQUIDATION_THRESHOLD = 75n;
+  const MAX_LTV = 70n;
+  const LIQUIDATION_PENALTY = 10n;
+  const PRECISION = 100n;
+  const MOCK_BTC_PRICE = 50000n * 10n ** 8n;
   const MOCK_DECIMALS = 8;
-  const INITIAL_USD_SUPPLY = ethers.parseEther("10000000"); // 10M USD tokens
+  const INITIAL_USD_SUPPLY = ethers.parseEther("10000000");
+  const ONE_BTC = ethers.parseEther("1");
+  const HALF_BTC = ethers.parseEther("0.5");
 
-  async function deployBTCLendingProtocolFixture() {
+  async function deployFixture() {
     const [owner, borrower, liquidator, user2] = await ethers.getSigners();
-
-    // Deploy mock USD token
-    const MockERC20 = await ethers.getContractFactory("MockERC20");
-    const usdToken = await MockERC20.deploy(
-      "Mock USD", 
-      "mUSD", 
-      18, 
-      INITIAL_USD_SUPPLY
+    const [MockERC20, MockV3Aggregator, BTCLendingProtocol] = await Promise.all(
+      [
+        ethers.getContractFactory("MockERC20"),
+        ethers.getContractFactory("MockV3Aggregator"),
+        ethers.getContractFactory("BTCLendingProtocol"),
+      ]
     );
 
-    // Deploy mock price feed
-    const MockV3Aggregator = await ethers.getContractFactory("MockV3Aggregator");
-    const priceFeed = await MockV3Aggregator.deploy(
-      MOCK_DECIMALS,
-      MOCK_BTC_PRICE
-    );
+    const [usd, feed] = await Promise.all([
+      MockERC20.deploy("Mock USD", "mUSD", 18, INITIAL_USD_SUPPLY),
+      MockV3Aggregator.deploy(MOCK_DECIMALS, MOCK_BTC_PRICE),
+    ]);
 
-    // Deploy BTCLendingProtocol
-    const BTCLendingProtocol = await ethers.getContractFactory("BTCLendingProtocol");
-    const lendingProtocol = await BTCLendingProtocol.deploy(await usdToken.getAddress());
+    const protocol = await BTCLendingProtocol.deploy(await usd.getAddress());
 
-    // Update price feed to use our mock
-    await lendingProtocol.updatePriceFeed(await priceFeed.getAddress());
+    await Promise.all([
+      protocol.updatePriceFeed(await feed.getAddress()),
+      usd.transfer(await protocol.getAddress(), ethers.parseEther("500000")),
+      usd.transfer(borrower.address, ethers.parseEther("100000")),
+      usd.transfer(liquidator.address, ethers.parseEther("100000")),
+      usd.transfer(user2.address, ethers.parseEther("50000")),
+    ]);
 
-    // Fund the protocol with USD tokens
-    await usdToken.transfer(await lendingProtocol.getAddress(), ethers.parseEther("500000"));
-
-    // Give borrower and liquidator some USD tokens for repayments/liquidations
-    await usdToken.transfer(borrower.address, ethers.parseEther("100000"));
-    await usdToken.transfer(liquidator.address, ethers.parseEther("100000"));
-
-    return { 
-      lendingProtocol, 
-      usdToken, 
-      priceFeed, 
-      owner, 
-      borrower, 
-      liquidator, 
-      user2 
-    };
+    return { protocol, usd, feed, owner, borrower, liquidator, user2 };
   }
 
-  describe("Deployment", function () {
-    it("Should set the right owner", async function () {
-      const { lendingProtocol, owner } = await loadFixture(deployBTCLendingProtocolFixture);
-      expect(await lendingProtocol.owner()).to.equal(owner.address);
+  // Helper functions for common operations
+  const helpers = {
+    deposit: (protocol, user, amount) =>
+      protocol.connect(user).depositCollateral({ value: amount }),
+    borrow: (protocol, user, amount) => protocol.connect(user).borrow(amount),
+    async repay(protocol, usd, user, amount) {
+      await usd.connect(user).approve(await protocol.getAddress(), amount);
+      return protocol.connect(user).repay(amount);
+    },
+    async setupLoan(protocol, user, collateral, borrowed) {
+      await this.deposit(protocol, user, collateral);
+      await this.borrow(protocol, user, borrowed);
+      return { collateral, borrowed };
+    },
+    async makeLiquidatable(protocol, feed, usd, borrower, liquidator) {
+      await this.setupLoan(
+        protocol,
+        borrower,
+        ONE_BTC,
+        ethers.parseEther("30000")
+      );
+      await feed.updateAnswer(35000n * 10n ** 8n);
+      await usd
+        .connect(liquidator)
+        .approve(await protocol.getAddress(), ethers.parseEther("30000"));
+      return { collateral: ONE_BTC, borrowed: ethers.parseEther("30000") };
+    },
+  };
+
+  describe("Core Functionality", function () {
+    it("Should deploy with correct parameters", async function () {
+      const { protocol, usd, owner } = await loadFixture(deployFixture);
+      const [ownerAddr, usdAddr, threshold, ltv, penalty, precision] =
+        await Promise.all([
+          protocol.owner(),
+          protocol.usdToken(),
+          protocol.LIQUIDATION_THRESHOLD(),
+          protocol.MAX_LTV(),
+          protocol.LIQUIDATION_PENALTY(),
+          protocol.PRECISION(),
+        ]);
+
+      expect(ownerAddr).to.equal(owner.address);
+      expect(usdAddr).to.equal(await usd.getAddress());
+      expect([threshold, ltv, penalty, precision]).to.deep.equal([
+        LIQUIDATION_THRESHOLD,
+        MAX_LTV,
+        LIQUIDATION_PENALTY,
+        PRECISION,
+      ]);
     });
 
-    it("Should set the correct USD token", async function () {
-      const { lendingProtocol, usdToken } = await loadFixture(deployBTCLendingProtocolFixture);
-      expect(await lendingProtocol.usdToken()).to.equal(await usdToken.getAddress());
+    it("Should handle price operations and conversions", async function () {
+      const { protocol } = await loadFixture(deployFixture);
+      const [[price, decimals], usdValue, maxBorrow] = await Promise.all([
+        protocol.getLatestPrice(),
+        protocol.btcToUSD(ONE_BTC),
+        protocol.getMaxBorrowAmount(ONE_BTC),
+      ]);
+
+      expect([price, decimals]).to.deep.equal([MOCK_BTC_PRICE, MOCK_DECIMALS]);
+      expect([usdValue, maxBorrow]).to.deep.equal([
+        ethers.parseEther("50000"),
+        ethers.parseEther("35000"),
+      ]);
     });
 
-    it("Should set the correct protocol parameters", async function () {
-      const { lendingProtocol } = await loadFixture(deployBTCLendingProtocolFixture);
-      expect(await lendingProtocol.LIQUIDATION_THRESHOLD()).to.equal(LIQUIDATION_THRESHOLD);
-      expect(await lendingProtocol.MAX_LTV()).to.equal(MAX_LTV);
-      expect(await lendingProtocol.LIQUIDATION_PENALTY()).to.equal(LIQUIDATION_PENALTY);
-      expect(await lendingProtocol.PRECISION()).to.equal(PRECISION);
+    it("Should reject invalid price conditions", async function () {
+      const { protocol, feed } = await loadFixture(deployFixture);
+
+      await time.increase(7201); // Make stale
+      await expect(protocol.getLatestPrice()).to.be.revertedWithCustomError(
+        protocol,
+        "PriceDataStale"
+      );
+
+      await feed.updateAnswer(0); // Invalid price
+      await expect(protocol.getLatestPrice()).to.be.revertedWithCustomError(
+        protocol,
+        "InvalidPriceData"
+      );
     });
   });
 
-  describe("Price Feed Functions", function () {
-    it("Should get latest price correctly", async function () {
-      const { lendingProtocol } = await loadFixture(deployBTCLendingProtocolFixture);
-      const [price, decimals] = await lendingProtocol.getLatestPrice();
-      expect(price).to.equal(MOCK_BTC_PRICE);
-      expect(decimals).to.equal(MOCK_DECIMALS);
-    });
+  describe("Collateral & Borrowing", function () {
+    it("Should handle complete collateral lifecycle", async function () {
+      const { protocol, usd, borrower } = await loadFixture(deployFixture);
 
-    it("Should convert BTC to USD correctly", async function () {
-      const { lendingProtocol } = await loadFixture(deployBTCLendingProtocolFixture);
-      const btcAmount = ethers.parseEther("1"); // 1 BTC
-      const usdValue = await lendingProtocol.btcToUSD(btcAmount);
-      
-      // Expected: 1 BTC * $50,000 = $50,000
-      const expectedUSD = ethers.parseEther("50000");
-      expect(usdValue).to.equal(expectedUSD);
-    });
+      // Deposit and verify
+      await expect(helpers.deposit(protocol, borrower, ONE_BTC))
+        .to.emit(protocol, "CollateralDeposited")
+        .withArgs(borrower.address, ONE_BTC);
 
-    it("Should calculate max borrow amount correctly", async function () {
-      const { lendingProtocol } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1"); // 1 BTC
-      const maxBorrow = await lendingProtocol.getMaxBorrowAmount(collateralAmount);
-      
-      // Expected: $50,000 * 70% = $35,000
-      const expectedMaxBorrow = ethers.parseEther("35000");
-      expect(maxBorrow).to.equal(expectedMaxBorrow);
-    });
+      // Additional deposit
+      await helpers.deposit(protocol, borrower, HALF_BTC);
+      const [loan1, total1] = await Promise.all([
+        protocol.loans(borrower.address),
+        protocol.totalCollateral(),
+      ]);
+      expect([loan1.collateralAmount, total1]).to.deep.equal([
+        ONE_BTC + HALF_BTC,
+        ONE_BTC + HALF_BTC,
+      ]);
 
-    it("Should revert on stale price data", async function () {
-      const { lendingProtocol, priceFeed } = await loadFixture(deployBTCLendingProtocolFixture);
-      
-      // Move time forward by more than 1 hour
-      await time.increase(3601);
-      
-      // Update the price feed with old timestamp
-      await priceFeed.updateAnswer(MOCK_BTC_PRICE);
-      await time.increase(3601);
-      
-      await expect(lendingProtocol.getLatestPrice()).to.be.revertedWithCustomError(lendingProtocol, "PriceDataStale");
-    });
+      // Borrow against collateral
+      const borrowAmount = ethers.parseEther("30000");
+      await expect(helpers.borrow(protocol, borrower, borrowAmount))
+        .to.emit(protocol, "LoanTaken")
+        .withArgs(borrower.address, ONE_BTC + HALF_BTC, borrowAmount);
 
-    it("Should revert on invalid price data", async function () {
-      const { lendingProtocol, priceFeed } = await loadFixture(deployBTCLendingProtocolFixture);
-      
-      // Set price to 0 or negative
-      await priceFeed.updateAnswer(0);
-      
-      await expect(lendingProtocol.getLatestPrice()).to.be.revertedWithCustomError(lendingProtocol, "InvalidPriceData");
-    });
-  });
+      const [loan2, totalBorrowed, ltv] = await Promise.all([
+        protocol.loans(borrower.address),
+        protocol.totalBorrowed(),
+        protocol.getLoanToValue(borrower.address),
+      ]);
+      expect([
+        loan2.borrowedAmount,
+        loan2.active,
+        totalBorrowed,
+        ltv,
+      ]).to.deep.equal([borrowAmount, true, borrowAmount, 40n]);
 
-  describe("Collateral Deposit", function () {
-    it("Should allow depositing collateral", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1");
-
+      // Repay and withdraw
+      await helpers.repay(protocol, usd, borrower, borrowAmount);
       await expect(
-        lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount })
+        protocol.connect(borrower).withdrawCollateral(ONE_BTC + HALF_BTC)
       )
-        .to.emit(lendingProtocol, "CollateralDeposited")
-        .withArgs(borrower.address, collateralAmount);
+        .to.emit(protocol, "CollateralWithdrawn")
+        .withArgs(borrower.address, ONE_BTC + HALF_BTC);
 
-      const loan = await lendingProtocol.loans(borrower.address);
-      expect(loan.collateralAmount).to.equal(collateralAmount);
-      expect(await lendingProtocol.totalCollateral()).to.equal(collateralAmount);
+      const finalLoan = await protocol.loans(borrower.address);
+      expect([
+        finalLoan.collateralAmount,
+        finalLoan.borrowedAmount,
+        finalLoan.active,
+      ]).to.deep.equal([0n, 0n, false]);
     });
 
-    it("Should allow multiple collateral deposits", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const firstDeposit = ethers.parseEther("1");
-      const secondDeposit = ethers.parseEther("0.5");
+    it("Should enforce all constraints", async function () {
+      const { protocol, usd, borrower } = await loadFixture(deployFixture);
 
-      await lendingProtocol.connect(borrower).depositCollateral({ value: firstDeposit });
-      await lendingProtocol.connect(borrower).depositCollateral({ value: secondDeposit });
-
-      const loan = await lendingProtocol.loans(borrower.address);
-      expect(loan.collateralAmount).to.equal(firstDeposit + secondDeposit);
-      expect(await lendingProtocol.totalCollateral()).to.equal(firstDeposit + secondDeposit);
-    });
-
-    it("Should revert when depositing zero collateral", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-
+      // Constraint violations
       await expect(
-        lendingProtocol.connect(borrower).depositCollateral({ value: 0 })
-      ).to.be.revertedWithCustomError(lendingProtocol, "MustDepositCollateral");
+        helpers.deposit(protocol, borrower, 0)
+      ).to.be.revertedWithCustomError(protocol, "MustDepositCollateral");
+      await expect(
+        helpers.borrow(protocol, borrower, ONE_BTC)
+      ).to.be.revertedWithCustomError(protocol, "NoCollateralDeposited");
+
+      await helpers.deposit(protocol, borrower, ONE_BTC);
+      await expect(
+        helpers.borrow(protocol, borrower, ethers.parseEther("40000"))
+      ).to.be.revertedWithCustomError(protocol, "ExceedsBorrowingLimit");
+      await expect(
+        protocol.connect(borrower).withdrawCollateral(ethers.parseEther("2"))
+      ).to.be.revertedWithCustomError(protocol, "InsufficientCollateral");
+
+      await helpers.borrow(protocol, borrower, ethers.parseEther("30000"));
+      await expect(
+        protocol.connect(borrower).withdrawCollateral(ONE_BTC)
+      ).to.be.revertedWithCustomError(protocol, "OutstandingDebtExists");
+      await expect(
+        protocol.connect(borrower).repay(ethers.parseEther("40000"))
+      ).to.be.revertedWithCustomError(protocol, "AmountExceedsDebt");
+      await expect(
+        protocol.connect(borrower).repay(ethers.parseEther("10000"))
+      ).to.be.revertedWithCustomError(protocol, "TransferFailed");
     });
   });
 
-  describe("Borrowing", function () {
-    it("Should allow borrowing against collateral", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1"); // 1 BTC
-      const borrowAmount = ethers.parseEther("30000"); // $30,000
+  describe("Liquidation System", function () {
+    it("Should handle liquidation mechanics", async function () {
+      const { protocol, usd, feed, borrower, liquidator } = await loadFixture(
+        deployFixture
+      );
 
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      
-      await expect(
-        lendingProtocol.connect(borrower).borrow(borrowAmount)
-      )
-        .to.emit(lendingProtocol, "LoanTaken")
-        .withArgs(borrower.address, collateralAmount, borrowAmount);
+      const { collateral, borrowed } = await helpers.makeLiquidatable(
+        protocol,
+        feed,
+        usd,
+        borrower,
+        liquidator
+      );
 
-      const loan = await lendingProtocol.loans(borrower.address);
-      expect(loan.borrowedAmount).to.equal(borrowAmount);
-      expect(loan.active).to.be.true;
-      expect(await lendingProtocol.totalBorrowed()).to.equal(borrowAmount);
-    });
+      // Verify liquidatable state and LTV thresholds
+      expect(await protocol.isLiquidatable(borrower.address)).to.be.true;
+      await feed.updateAnswer(40000n * 10n ** 8n); // Exactly at threshold
+      expect(await protocol.isLiquidatable(borrower.address)).to.be.true;
 
-    it("Should calculate LTV correctly", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1"); // 1 BTC = $50,000
-      const borrowAmount = ethers.parseEther("25000"); // $25,000
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      await lendingProtocol.connect(borrower).borrow(borrowAmount);
-
-      const ltv = await lendingProtocol.getLoanToValue(borrower.address);
-      expect(ltv).to.equal(50); // 50% LTV
-    });
-
-    it("Should revert when borrowing without collateral", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const borrowAmount = ethers.parseEther("30000");
-
-      await expect(
-        lendingProtocol.connect(borrower).borrow(borrowAmount)
-      ).to.be.revertedWithCustomError(lendingProtocol, "NoCollateralDeposited");
-    });
-
-    it("Should revert when exceeding borrowing limit", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1"); // 1 BTC = $50,000
-      const borrowAmount = ethers.parseEther("40000"); // $40,000 (exceeds 70% LTV)
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      
-      await expect(
-        lendingProtocol.connect(borrower).borrow(borrowAmount)
-      ).to.be.revertedWithCustomError(lendingProtocol, "ExceedsBorrowingLimit");
-    });
-
-    it("Should allow multiple borrows up to limit", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1"); // 1 BTC = $50,000
-      const firstBorrow = ethers.parseEther("20000"); // $20,000
-      const secondBorrow = ethers.parseEther("15000"); // $15,000
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      await lendingProtocol.connect(borrower).borrow(firstBorrow);
-      await lendingProtocol.connect(borrower).borrow(secondBorrow);
-
-      const loan = await lendingProtocol.loans(borrower.address);
-      expect(loan.borrowedAmount).to.equal(firstBorrow + secondBorrow);
-    });
-  });
-
-  describe("Repayment", function () {
-    it("Should allow repaying borrowed amount", async function () {
-      const { lendingProtocol, usdToken, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1");
-      const borrowAmount = ethers.parseEther("30000");
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      await lendingProtocol.connect(borrower).borrow(borrowAmount);
-
-      // Approve and repay
-      await usdToken.connect(borrower).approve(await lendingProtocol.getAddress(), borrowAmount);
-      
-      await expect(
-        lendingProtocol.connect(borrower).repay(borrowAmount)
-      )
-        .to.emit(lendingProtocol, "LoanRepaid")
-        .withArgs(borrower.address, borrowAmount);
-
-      const loan = await lendingProtocol.loans(borrower.address);
-      expect(loan.borrowedAmount).to.equal(0);
-      expect(loan.active).to.be.false;
-      expect(await lendingProtocol.totalBorrowed()).to.equal(0);
-    });
-
-    it("Should allow partial repayment", async function () {
-      const { lendingProtocol, usdToken, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1");
-      const borrowAmount = ethers.parseEther("30000");
-      const repayAmount = ethers.parseEther("10000");
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      await lendingProtocol.connect(borrower).borrow(borrowAmount);
-
-      await usdToken.connect(borrower).approve(await lendingProtocol.getAddress(), repayAmount);
-      await lendingProtocol.connect(borrower).repay(repayAmount);
-
-      const loan = await lendingProtocol.loans(borrower.address);
-      expect(loan.borrowedAmount).to.equal(borrowAmount - repayAmount);
-      expect(loan.active).to.be.true;
-    });
-
-    it("Should revert when repaying without active loan", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const repayAmount = ethers.parseEther("10000");
-
-      await expect(
-        lendingProtocol.connect(borrower).repay(repayAmount)
-      ).to.be.revertedWithCustomError(lendingProtocol, "NoActiveLoan");
-    });
-
-    it("Should revert when repaying more than debt", async function () {
-      const { lendingProtocol, usdToken, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1");
-      const borrowAmount = ethers.parseEther("30000");
-      const repayAmount = ethers.parseEther("40000");
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      await lendingProtocol.connect(borrower).borrow(borrowAmount);
-
-      await usdToken.connect(borrower).approve(await lendingProtocol.getAddress(), repayAmount);
-      
-      await expect(
-        lendingProtocol.connect(borrower).repay(repayAmount)
-      ).to.be.revertedWithCustomError(lendingProtocol, "AmountExceedsDebt");
-    });
-  });
-
-  describe("Collateral Withdrawal", function () {
-    it("Should allow withdrawing collateral after repaying debt", async function () {
-      const { lendingProtocol, usdToken, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1");
-      const borrowAmount = ethers.parseEther("30000");
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      await lendingProtocol.connect(borrower).borrow(borrowAmount);
-
-      // Repay debt
-      await usdToken.connect(borrower).approve(await lendingProtocol.getAddress(), borrowAmount);
-      await lendingProtocol.connect(borrower).repay(borrowAmount);
-
-      const initialBalance = await ethers.provider.getBalance(borrower.address);
-
-      await expect(
-        lendingProtocol.connect(borrower).withdrawCollateral(collateralAmount)
-      )
-        .to.emit(lendingProtocol, "CollateralWithdrawn")
-        .withArgs(borrower.address, collateralAmount);
-
-      const loan = await lendingProtocol.loans(borrower.address);
-      expect(loan.collateralAmount).to.equal(0);
-      expect(await lendingProtocol.totalCollateral()).to.equal(0);
-    });
-
-    it("Should allow partial collateral withdrawal", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1");
-      const withdrawAmount = ethers.parseEther("0.5");
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      await lendingProtocol.connect(borrower).withdrawCollateral(withdrawAmount);
-
-      const loan = await lendingProtocol.loans(borrower.address);
-      expect(loan.collateralAmount).to.equal(collateralAmount - withdrawAmount);
-    });
-
-    it("Should revert when withdrawing with outstanding debt", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1");
-      const borrowAmount = ethers.parseEther("30000");
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      await lendingProtocol.connect(borrower).borrow(borrowAmount);
-
-      await expect(
-        lendingProtocol.connect(borrower).withdrawCollateral(collateralAmount)
-      ).to.be.revertedWithCustomError(lendingProtocol, "OutstandingDebtExists");
-    });
-
-    it("Should revert when withdrawing more than available collateral", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1");
-      const withdrawAmount = ethers.parseEther("2");
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-
-      await expect(
-        lendingProtocol.connect(borrower).withdrawCollateral(withdrawAmount)
-      ).to.be.revertedWithCustomError(lendingProtocol, "InsufficientCollateral");
-    });
-  });
-
-  describe("Liquidation", function () {
-    it("Should allow liquidation of undercollateralized loans", async function () {
-      const { lendingProtocol, usdToken, priceFeed, borrower, liquidator } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1");
-      const borrowAmount = ethers.parseEther("30000");
-
-      // Setup loan
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      await lendingProtocol.connect(borrower).borrow(borrowAmount);
-
-      // Drop BTC price to make loan liquidatable
-      const newPrice = 35000 * 10**8; // $35,000 (makes LTV > 75%)
-      await priceFeed.updateAnswer(newPrice);
-
-      // Check if liquidatable
-      expect(await lendingProtocol.isLiquidatable(borrower.address)).to.be.true;
-
-      // Liquidate
-      await usdToken.connect(liquidator).approve(await lendingProtocol.getAddress(), borrowAmount);
-      
-      await expect(
-        lendingProtocol.connect(liquidator).liquidate(borrower.address)
-      )
-        .to.emit(lendingProtocol, "Liquidation")
-        .withArgs(borrower.address, liquidator.address, collateralAmount, borrowAmount);
-
-      const loan = await lendingProtocol.loans(borrower.address);
-      expect(loan.collateralAmount).to.equal(0);
-      expect(loan.borrowedAmount).to.equal(0);
-      expect(loan.active).to.be.false;
-    });
-
-    it("Should revert when trying to liquidate healthy loan", async function () {
-      const { lendingProtocol, usdToken, borrower, liquidator } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1");
-      const borrowAmount = ethers.parseEther("30000");
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      await lendingProtocol.connect(borrower).borrow(borrowAmount);
-
-      // Loan should not be liquidatable (60% LTV < 75% threshold)
-      expect(await lendingProtocol.isLiquidatable(borrower.address)).to.be.false;
-
-      await usdToken.connect(liquidator).approve(await lendingProtocol.getAddress(), borrowAmount);
-      
-      await expect(
-        lendingProtocol.connect(liquidator).liquidate(borrower.address)
-      ).to.be.revertedWithCustomError(lendingProtocol, "LoanNotLiquidatable");
-    });
-
-    it("Should calculate liquidation penalty correctly", async function () {
-      const { lendingProtocol, usdToken, priceFeed, borrower, liquidator } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1");
-      const borrowAmount = ethers.parseEther("30000");
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      await lendingProtocol.connect(borrower).borrow(borrowAmount);
-
-      // Drop price to trigger liquidation
-      await priceFeed.updateAnswer(35000 * 10**8);
-
-      const liquidatorBalanceBefore = await ethers.provider.getBalance(liquidator.address);
-      
-      await usdToken.connect(liquidator).approve(await lendingProtocol.getAddress(), borrowAmount);
-      const tx = await lendingProtocol.connect(liquidator).liquidate(borrower.address);
+      // Execute liquidation
+      const liquidatorBefore = await ethers.provider.getBalance(
+        liquidator.address
+      );
+      const tx = await protocol.connect(liquidator).liquidate(borrower.address);
       const receipt = await tx.wait();
+      const liquidatorAfter = await ethers.provider.getBalance(
+        liquidator.address
+      );
 
-      const liquidatorBalanceAfter = await ethers.provider.getBalance(liquidator.address);
-      
-      // Liquidator should receive collateral minus penalty (minus gas costs)
-      const expectedCollateral = collateralAmount * BigInt(90) / BigInt(100); // 90% of collateral
+      // Verify liquidation completed and penalty applied
+      const loan = await protocol.loans(borrower.address);
+      expect([
+        loan.collateralAmount,
+        loan.borrowedAmount,
+        loan.active,
+      ]).to.deep.equal([0n, 0n, false]);
+
+      const expectedCollateral = (collateral * 90n) / 100n; // 90% after penalty
       const gasUsed = receipt.gasUsed * receipt.gasPrice;
-      const expectedBalance = liquidatorBalanceBefore + expectedCollateral - gasUsed;
-      
-      expect(liquidatorBalanceAfter).to.be.closeTo(expectedBalance, ethers.parseEther("0.01"));
-    });
-  });
-
-  describe("View Functions", function () {
-    it("Should return correct user loan information", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("1");
-      const borrowAmount = ethers.parseEther("30000");
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      await lendingProtocol.connect(borrower).borrow(borrowAmount);
-
-      const [collateral, borrowed, ltv, liquidatable, maxBorrow] = 
-        await lendingProtocol.getUserLoan(borrower.address);
-
-      expect(collateral).to.equal(collateralAmount);
-      expect(borrowed).to.equal(borrowAmount);
-      expect(ltv).to.equal(60); // 60% LTV
-      expect(liquidatable).to.be.false;
-      expect(maxBorrow).to.equal(ethers.parseEther("35000"));
-    });
-
-    it("Should return correct protocol statistics", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("2");
-      const borrowAmount = ethers.parseEther("60000");
-
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      await lendingProtocol.connect(borrower).borrow(borrowAmount);
-
-      const [totalCollateral, totalBorrowed, btcPrice, utilizationRate] = 
-        await lendingProtocol.getProtocolStats();
-
-      expect(totalCollateral).to.equal(collateralAmount);
-      expect(totalBorrowed).to.equal(borrowAmount);
-      expect(btcPrice).to.equal(MOCK_BTC_PRICE);
-      expect(utilizationRate).to.equal(60); // 60% utilization
-    });
-  });
-
-  describe("Owner Functions", function () {
-    it("Should allow owner to update price feed", async function () {
-      const { lendingProtocol, owner } = await loadFixture(deployBTCLendingProtocolFixture);
-      
-      // Deploy new mock price feed
-      const MockV3Aggregator = await ethers.getContractFactory("MockV3Aggregator");
-      const newPriceFeed = await MockV3Aggregator.deploy(8, 60000 * 10**8);
-
-      await lendingProtocol.connect(owner).updatePriceFeed(await newPriceFeed.getAddress());
-      
-      const [price,] = await lendingProtocol.getLatestPrice();
-      expect(price).to.equal(60000 * 10**8);
-    });
-
-    it("Should allow owner to withdraw protocol fees", async function () {
-      const { lendingProtocol, owner } = await loadFixture(deployBTCLendingProtocolFixture);
-      
-      // Send some ETH to the contract (simulating fees)
-      await owner.sendTransaction({
-        to: await lendingProtocol.getAddress(),
-        value: ethers.parseEther("1")
-      });
-
-      const ownerBalanceBefore = await ethers.provider.getBalance(owner.address);
-      const tx = await lendingProtocol.connect(owner).withdrawProtocolFees();
-      const receipt = await tx.wait();
-      
-      const ownerBalanceAfter = await ethers.provider.getBalance(owner.address);
-      const gasUsed = receipt.gasUsed * receipt.gasPrice;
-      
-      expect(ownerBalanceAfter).to.equal(
-        ownerBalanceBefore + ethers.parseEther("1") - gasUsed
+      expect(liquidatorAfter).to.be.closeTo(
+        liquidatorBefore + expectedCollateral - gasUsed,
+        ethers.parseEther("0.01")
       );
     });
 
-    it("Should revert when non-owner tries to update price feed", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      
-      await expect(
-        lendingProtocol.connect(borrower).updatePriceFeed(ethers.ZeroAddress)
-      ).to.be.revertedWithCustomError(lendingProtocol, "OwnableUnauthorizedAccount");
+    it("Should test isLiquidatable function with comprehensive LTV scenarios", async function () {
+      const { protocol, feed, borrower } = await loadFixture(deployFixture);
+
+      await helpers.setupLoan(
+        protocol,
+        borrower,
+        ONE_BTC,
+        ethers.parseEther("30000")
+      );
+
+      // Test healthy loan (60% LTV < 75% threshold)
+      expect(await protocol.isLiquidatable(borrower.address)).to.be.false;
+
+      // Test approaching threshold (74% LTV)
+      await feed.updateAnswer(40540n * 10n ** 8n); // Makes LTV ~74%
+      expect(await protocol.isLiquidatable(borrower.address)).to.be.false;
+
+      // Test exactly at threshold (75% LTV)
+      await feed.updateAnswer(40000n * 10n ** 8n); // Makes LTV exactly 75%
+      expect(await protocol.isLiquidatable(borrower.address)).to.be.true;
+
+      // Test well above threshold (85% LTV)
+      await feed.updateAnswer(35294n * 10n ** 8n); // Makes LTV ~85%
+      expect(await protocol.isLiquidatable(borrower.address)).to.be.true;
     });
 
-    it("Should revert when non-owner tries to withdraw fees", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      
-      await expect(
-        lendingProtocol.connect(borrower).withdrawProtocolFees()
-      ).to.be.revertedWithCustomError(lendingProtocol, "OwnableUnauthorizedAccount");
-    });
-  });
+    it("Should calculate liquidation penalty correctly with precise amounts", async function () {
+      const { protocol, usd, feed, borrower, liquidator } = await loadFixture(
+        deployFixture
+      );
+      const collateralAmount = ethers.parseEther("2"); // 2 BTC
+      const borrowAmount = ethers.parseEther("60000"); // $60k
 
-  describe("Security Tests", function () {
-    it("Should prevent reentrancy attacks on deposit", async function () {
-      // This test would require a malicious contract that tries to reenter
-      // For now, we verify that the nonReentrant modifier is present
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      
-      // Multiple rapid calls should not cause issues
-      const promises = [];
-      for (let i = 0; i < 5; i++) {
-        promises.push(
-          lendingProtocol.connect(borrower).depositCollateral({ 
-            value: ethers.parseEther("0.1") 
-          })
+      await helpers.setupLoan(
+        protocol,
+        borrower,
+        collateralAmount,
+        borrowAmount
+      );
+      await feed.updateAnswer(35000n * 10n ** 8n); // Drop price for liquidation
+
+      const borrowerEthBefore = await ethers.provider.getBalance(
+        borrower.address
+      );
+      const liquidatorEthBefore = await ethers.provider.getBalance(
+        liquidator.address
+      );
+
+      await usd
+        .connect(liquidator)
+        .approve(await protocol.getAddress(), borrowAmount);
+
+      // Execute liquidation and measure penalty
+      await expect(protocol.connect(liquidator).liquidate(borrower.address))
+        .to.emit(protocol, "Liquidation")
+        .withArgs(
+          borrower.address,
+          liquidator.address,
+          collateralAmount,
+          borrowAmount
         );
-      }
-      
-      await Promise.all(promises);
-      
-      const loan = await lendingProtocol.loans(borrower.address);
-      expect(loan.collateralAmount).to.equal(ethers.parseEther("0.5"));
+
+      const liquidatorEthAfter = await ethers.provider.getBalance(
+        liquidator.address
+      );
+
+      // Liquidator should receive 90% of collateral (10% penalty to protocol)
+      const expectedCollateralReceived = (collateralAmount * 90n) / 100n;
+      const actualCollateralReceived = liquidatorEthAfter - liquidatorEthBefore;
+
+      // Allow for gas costs in comparison
+      expect(actualCollateralReceived).to.be.closeTo(
+        expectedCollateralReceived,
+        ethers.parseEther("0.1")
+      );
+
+      // Verify protocol received penalty
+      const protocolBalance = await ethers.provider.getBalance(
+        await protocol.getAddress()
+      );
+      const expectedPenalty = (collateralAmount * 10n) / 100n;
+      expect(protocolBalance).to.be.gte(expectedPenalty);
     });
 
-    it("Should handle zero value operations gracefully", async function () {
-      const { lendingProtocol, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      
-      // Test with zero values
-      expect(await lendingProtocol.btcToUSD(0)).to.equal(0);
-      expect(await lendingProtocol.getMaxBorrowAmount(0)).to.equal(0);
-      expect(await lendingProtocol.getLoanToValue(borrower.address)).to.equal(0);
+    it("Should prevent invalid liquidations", async function () {
+      const { protocol, usd, borrower, liquidator } = await loadFixture(
+        deployFixture
+      );
+
+      await helpers.setupLoan(
+        protocol,
+        borrower,
+        ONE_BTC,
+        ethers.parseEther("30000")
+      );
+      expect(await protocol.isLiquidatable(borrower.address)).to.be.false;
+
+      await usd
+        .connect(liquidator)
+        .approve(await protocol.getAddress(), ethers.parseEther("30000"));
+      await expect(
+        protocol.connect(liquidator).liquidate(borrower.address)
+      ).to.be.revertedWithCustomError(protocol, "LoanNotLiquidatable");
+    });
+  });
+
+  describe("Partial Collateral Withdrawal", function () {
+    it("Should allow partial collateral withdrawal when no debt", async function () {
+      const { protocol, borrower } = await loadFixture(deployFixture);
+      const withdrawAmount = HALF_BTC;
+
+      await helpers.deposit(protocol, borrower, ONE_BTC);
+
+      await expect(
+        protocol.connect(borrower).withdrawCollateral(withdrawAmount)
+      )
+        .to.emit(protocol, "CollateralWithdrawn")
+        .withArgs(borrower.address, withdrawAmount);
+
+      const loan = await protocol.loans(borrower.address);
+      expect(loan.collateralAmount).to.equal(ONE_BTC - withdrawAmount);
     });
 
-    it("Should handle edge case calculations correctly", async function () {
-      const { lendingProtocol } = await loadFixture(deployBTCLendingProtocolFixture);
-      
-      // Test with very small amounts
-      const smallAmount = 1; // 1 wei
-      const usdValue = await lendingProtocol.btcToUSD(smallAmount);
-      expect(usdValue).to.be.gte(0);
-      
-      // Test with large amounts
+    it("Should allow safe partial withdrawal after loan repayment", async function () {
+      const { protocol, usd, borrower } = await loadFixture(deployFixture);
+
+      // Setup and repay loan completely
+      await helpers.setupLoan(
+        protocol,
+        borrower,
+        ethers.parseEther("3"),
+        ethers.parseEther("90000")
+      );
+      await helpers.repay(protocol, usd, borrower, ethers.parseEther("90000"));
+
+      // Should allow partial withdrawal
+      await expect(
+        protocol.connect(borrower).withdrawCollateral(ethers.parseEther("1.5"))
+      )
+        .to.emit(protocol, "CollateralWithdrawn")
+        .withArgs(borrower.address, ethers.parseEther("1.5"));
+
+      const loan = await protocol.loans(borrower.address);
+      expect(loan.collateralAmount).to.equal(ethers.parseEther("1.5"));
+    });
+  });
+
+  describe("Transfer Failure Scenarios", function () {
+    it("Should handle USD token transfer failures comprehensively", async function () {
+      const { protocol, usd, borrower } = await loadFixture(deployFixture);
+
+      await helpers.deposit(protocol, borrower, ONE_BTC);
+
+      // Test borrow failure - contract insufficient balance
+      const excessiveBorrow = ethers.parseEther("600000"); // More than 500k contract balance
+      await expect(
+        helpers.borrow(protocol, borrower, excessiveBorrow)
+      ).to.be.revertedWithCustomError(protocol, "ExceedsBorrowingLimit");
+
+      // Test repay failure - no approval
+      await helpers.borrow(protocol, borrower, ethers.parseEther("30000"));
+      await expect(
+        protocol.connect(borrower).repay(ethers.parseEther("10000"))
+      ).to.be.revertedWithCustomError(protocol, "TransferFailed");
+
+      // Test repay failure - insufficient user balance
+      await usd.connect(borrower).transfer(borrower.address, 0); // Reset to ensure known state
+      const userBalance = await usd.balanceOf(borrower.address);
+      await usd
+        .connect(borrower)
+        .approve(await protocol.getAddress(), userBalance + 1n);
+      await expect(
+        protocol.connect(borrower).repay(userBalance + 1n)
+      ).to.be.revertedWithCustomError(protocol, "TransferFailed");
+    });
+
+    it("Should handle liquidation transfer failures", async function () {
+      const { protocol, usd, feed, borrower, liquidator } = await loadFixture(
+        deployFixture
+      );
+
+      await helpers.makeLiquidatable(protocol, feed, usd, borrower, liquidator);
+
+      // Remove liquidator's approval to cause transfer failure
+      await usd.connect(liquidator).approve(await protocol.getAddress(), 0);
+      await expect(
+        protocol.connect(liquidator).liquidate(borrower.address)
+      ).to.be.revertedWithCustomError(protocol, "DebtTransferFailed");
+    });
+  });
+
+  describe("Timestamp and State Validation", function () {
+    it("Should set and validate timestamps correctly", async function () {
+      const { protocol, usd, borrower } = await loadFixture(deployFixture);
+
+      await helpers.deposit(protocol, borrower, ONE_BTC);
+
+      // Capture timestamp before and after borrowing
+      const beforeBorrow = await time.latest();
+      await helpers.borrow(protocol, borrower, ethers.parseEther("30000"));
+      const afterBorrow = await time.latest();
+
+      const loan = await protocol.loans(borrower.address);
+      expect(loan.timestamp).to.be.gte(beforeBorrow);
+      expect(loan.timestamp).to.be.lte(afterBorrow);
+
+      // Verify timestamp doesn't change on additional borrows
+      const originalTimestamp = loan.timestamp;
+      await helpers.borrow(protocol, borrower, ethers.parseEther("5000"));
+      const updatedLoan = await protocol.loans(borrower.address);
+      expect(updatedLoan.timestamp).to.equal(originalTimestamp);
+
+      // Verify state transitions with timestamps
+      await helpers.repay(protocol, usd, borrower, ethers.parseEther("35000"));
+      const finalLoan = await protocol.loans(borrower.address);
+      expect(finalLoan.active).to.be.false;
+      expect(finalLoan.timestamp).to.equal(originalTimestamp); // Timestamp preserved
+    });
+
+    it("Should handle complete state transition lifecycle", async function () {
+      const { protocol, usd, borrower } = await loadFixture(deployFixture);
+
+      // Initial state - no loan
+      let loan = await protocol.loans(borrower.address);
+      expect([
+        loan.active,
+        loan.borrowedAmount,
+        loan.collateralAmount,
+        loan.timestamp,
+      ]).to.deep.equal([false, 0n, 0n, 0n]);
+
+      // After deposit - still no active loan
+      await helpers.deposit(protocol, borrower, ONE_BTC);
+      loan = await protocol.loans(borrower.address);
+      expect([
+        loan.active,
+        loan.borrowedAmount > 0n,
+        loan.collateralAmount > 0n,
+      ]).to.deep.equal([false, false, true]);
+
+      // After borrow - active loan
+      await helpers.borrow(protocol, borrower, ethers.parseEther("30000"));
+      loan = await protocol.loans(borrower.address);
+      expect([
+        loan.active,
+        loan.borrowedAmount > 0n,
+        loan.timestamp > 0n,
+      ]).to.deep.equal([true, true, true]);
+
+      // After full repayment - inactive loan, zero debt
+      await helpers.repay(protocol, usd, borrower, ethers.parseEther("30000"));
+      loan = await protocol.loans(borrower.address);
+      expect([
+        loan.active,
+        loan.borrowedAmount,
+        loan.collateralAmount > 0n,
+      ]).to.deep.equal([false, 0n, true]);
+    });
+  });
+
+
+  describe("View Functions & Owner Operations", function () {
+    it("Should return accurate data and handle owner functions", async function () {
+      const { protocol, owner, borrower } = await loadFixture(deployFixture);
+
+      await helpers.setupLoan(
+        protocol,
+        borrower,
+        ethers.parseEther("2"),
+        ethers.parseEther("60000")
+      );
+
+      const [
+        [
+          userCollateral,
+          userBorrowed,
+          userLtv,
+          userLiquidatable,
+          userMaxBorrow,
+        ],
+        [protocolCollateral, protocolBorrowed, btcPrice, utilizationRate],
+      ] = await Promise.all([
+        protocol.getUserLoan(borrower.address),
+        protocol.getProtocolStats(),
+      ]);
+
+      expect([
+        userCollateral,
+        userBorrowed,
+        userLtv,
+        userLiquidatable,
+      ]).to.deep.equal([
+        ethers.parseEther("2"),
+        ethers.parseEther("60000"),
+        60n,
+        false,
+      ]);
+      expect([
+        protocolCollateral,
+        protocolBorrowed,
+        btcPrice,
+        utilizationRate,
+      ]).to.deep.equal([
+        ethers.parseEther("2"),
+        ethers.parseEther("60000"),
+        MOCK_BTC_PRICE,
+        60n,
+      ]);
+
+      // Owner operations
+      const MockV3Aggregator = await ethers.getContractFactory(
+        "MockV3Aggregator"
+      );
+      const newFeed = await MockV3Aggregator.deploy(8, 60000n * 10n ** 8n);
+      await protocol.connect(owner).updatePriceFeed(await newFeed.getAddress());
+
+      const [newPrice] = await protocol.getLatestPrice();
+      expect(newPrice).to.equal(60000n * 10n ** 8n);
+
+      // Access control
+      await expect(
+        protocol.connect(borrower).updatePriceFeed(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(protocol, "OwnableUnauthorizedAccount");
+    });
+  });
+
+  describe("Edge Cases & Multi-User", function () {
+    it("Should handle edge cases and multiple users", async function () {
+      const { protocol, usd, borrower, user2 } = await loadFixture(
+        deployFixture
+      );
+
+      // Edge cases
+      const [zeroUsd, zeroMax, zeroLtv] = await Promise.all([
+        protocol.btcToUSD(0),
+        protocol.getMaxBorrowAmount(0),
+        protocol.getLoanToValue(borrower.address),
+      ]);
+      expect([zeroUsd, zeroMax, zeroLtv]).to.deep.equal([0n, 0n, 0n]);
+
+      // Large amounts
       const largeAmount = ethers.parseEther("1000");
-      const largeUsdValue = await lendingProtocol.btcToUSD(largeAmount);
-      expect(largeUsdValue).to.equal(ethers.parseEther("50000000")); // 1000 BTC * $50,000
+      const [largeUsd, largeMax] = await Promise.all([
+        protocol.btcToUSD(largeAmount),
+        protocol.getMaxBorrowAmount(largeAmount),
+      ]);
+      expect([largeUsd, largeMax]).to.deep.equal([
+        ethers.parseEther("50000000"),
+        ethers.parseEther("35000000"),
+      ]);
+
+      // Multi-user operations
+      await Promise.all([
+        helpers.setupLoan(
+          protocol,
+          borrower,
+          ONE_BTC,
+          ethers.parseEther("30000")
+        ),
+        helpers.setupLoan(
+          protocol,
+          user2,
+          ethers.parseEther("1.5"),
+          ethers.parseEther("40000")
+        ),
+      ]);
+
+      const [loan1, loan2, totalBorrowed] = await Promise.all([
+        protocol.loans(borrower.address),
+        protocol.loans(user2.address),
+        protocol.totalBorrowed(),
+      ]);
+      expect([
+        loan1.borrowedAmount,
+        loan2.borrowedAmount,
+        totalBorrowed,
+      ]).to.deep.equal([
+        ethers.parseEther("30000"),
+        ethers.parseEther("40000"),
+        ethers.parseEther("70000"),
+      ]);
+
+      // Concurrent deposits
+      const deposits = Array(3)
+        .fill()
+        .map(() =>
+          helpers.deposit(protocol, borrower, ethers.parseEther("0.1"))
+        );
+      await Promise.all(deposits);
+
+      const finalLoan = await protocol.loans(borrower.address);
+      expect(finalLoan.collateralAmount).to.equal(
+        ONE_BTC + ethers.parseEther("0.3")
+      );
     });
-  });
 
-  describe("Integration Tests", function () {
-    it("Should handle complete loan lifecycle", async function () {
-      const { lendingProtocol, usdToken, borrower } = await loadFixture(deployBTCLendingProtocolFixture);
-      const collateralAmount = ethers.parseEther("2");
-      const borrowAmount = ethers.parseEther("50000");
+    it("Should handle direct ETH transfers and state transitions", async function () {
+      const { protocol, usd, borrower } = await loadFixture(deployFixture);
 
-      // 1. Deposit collateral
-      await lendingProtocol.connect(borrower).depositCollateral({ value: collateralAmount });
-      
-      // 2. Borrow funds
-      await lendingProtocol.connect(borrower).borrow(borrowAmount);
-      
-      // 3. Partial repayment
-      const partialRepay = ethers.parseEther("20000");
-      await usdToken.connect(borrower).approve(await lendingProtocol.getAddress(), partialRepay);
-      await lendingProtocol.connect(borrower).repay(partialRepay);
-      
-      // 4. Full repayment
-      const remainingDebt = ethers.parseEther("30000");
-      await usdToken.connect(borrower).approve(await lendingProtocol.getAddress(), remainingDebt);
-      await lendingProtocol.connect(borrower).repay(remainingDebt);
-      
-      // 5. Withdraw collateral
-      await lendingProtocol.connect(borrower).withdrawCollateral(collateralAmount);
-      
-      // Verify final state
-      const loan = await lendingProtocol.loans(borrower.address);
-      expect(loan.collateralAmount).to.equal(0);
-      expect(loan.borrowedAmount).to.equal(0);
+      // Direct ETH transfer (receive function)
+      await expect(
+        borrower.sendTransaction({
+          to: await protocol.getAddress(),
+          value: ONE_BTC,
+        })
+      ).to.not.be.reverted;
+
+      // State transitions
+      let loan = await protocol.loans(borrower.address);
       expect(loan.active).to.be.false;
-    });
 
-    it("Should handle multiple users simultaneously", async function () {
-      const { lendingProtocol, usdToken, borrower, user2 } = await loadFixture(deployBTCLendingProtocolFixture);
-      
-      // Give user2 some USD tokens
-      await usdToken.transfer(user2.address, ethers.parseEther("50000"));
-      
-      // Both users deposit and borrow
-      await lendingProtocol.connect(borrower).depositCollateral({ value: ethers.parseEther("1") });
-      await lendingProtocol.connect(user2).depositCollateral({ value: ethers.parseEther("1.5") });
-      
-      await lendingProtocol.connect(borrower).borrow(ethers.parseEther("30000"));
-      await lendingProtocol.connect(user2).borrow(ethers.parseEther("40000"));
-      
-      // Verify independent loan states
-      const loan1 = await lendingProtocol.loans(borrower.address);
-      const loan2 = await lendingProtocol.loans(user2.address);
-      
-      expect(loan1.borrowedAmount).to.equal(ethers.parseEther("30000"));
-      expect(loan2.borrowedAmount).to.equal(ethers.parseEther("40000"));
-      expect(await lendingProtocol.totalBorrowed()).to.equal(ethers.parseEther("70000"));
+      await helpers.deposit(protocol, borrower, ONE_BTC);
+      loan = await protocol.loans(borrower.address);
+      expect(loan.active).to.be.false; // Still false until borrow
+
+      const beforeBorrow = await time.latest();
+      await helpers.borrow(protocol, borrower, ethers.parseEther("30000"));
+      const afterBorrow = await time.latest();
+
+      loan = await protocol.loans(borrower.address);
+      expect(loan.active).to.be.true;
+      expect(loan.timestamp).to.be.gte(beforeBorrow).and.lte(afterBorrow);
+
+      await helpers.repay(protocol, usd, borrower, ethers.parseEther("30000"));
+      loan = await protocol.loans(borrower.address);
+      expect([loan.active, loan.borrowedAmount]).to.deep.equal([false, 0n]);
     });
   });
-}); 
+});

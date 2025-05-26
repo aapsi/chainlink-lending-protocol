@@ -135,8 +135,10 @@ contract BTCLendingProtocol is ReentrancyGuard, Ownable {
         if (loan.borrowedAmount + _amount > maxBorrow) revert ExceedsBorrowingLimit();
         
         loan.borrowedAmount += _amount;
-        loan.active = true;
-        loan.timestamp = block.timestamp;
+        if (!loan.active) {
+            loan.active = true;
+            loan.timestamp = block.timestamp;
+        }
         totalBorrowed += _amount;
         
         // Transfer USD tokens to borrower
