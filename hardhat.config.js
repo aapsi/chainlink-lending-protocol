@@ -3,7 +3,7 @@ require("dotenv").config();
 
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
-  solidity: "0.8.28",
+  solidity: "0.8.29",
   networks: {
     rskTestnet: {
       url: "https://public-node.testnet.rsk.co",

@@ -209,9 +209,10 @@ describe("BTCLendingProtocol", function () {
       await expect(
         protocol.connect(borrower).repay(ethers.parseEther("40000"))
       ).to.be.revertedWithCustomError(protocol, "AmountExceedsDebt");
+      
       await expect(
         protocol.connect(borrower).repay(ethers.parseEther("10000"))
-      ).to.be.revertedWithCustomError(protocol, "TransferFailed");
+      ).to.be.revertedWithCustomError(usd, "ERC20InsufficientAllowance");
     });
   });
 
@@ -409,7 +410,7 @@ describe("BTCLendingProtocol", function () {
 
   describe("Transfer Failure Scenarios", function () {
     it("Should handle USD token transfer failures comprehensively", async function () {
-      const { protocol, usd, borrower } = await loadFixture(deployFixture);
+      const { protocol, usd, borrower, owner } = await loadFixture(deployFixture);
 
       await helpers.deposit(protocol, borrower, ONE_BTC);
 
@@ -423,17 +424,22 @@ describe("BTCLendingProtocol", function () {
       await helpers.borrow(protocol, borrower, ethers.parseEther("30000"));
       await expect(
         protocol.connect(borrower).repay(ethers.parseEther("10000"))
-      ).to.be.revertedWithCustomError(protocol, "TransferFailed");
+      ).to.be.revertedWithCustomError(usd, "ERC20InsufficientAllowance");
 
       // Test repay failure - insufficient user balance
-      await usd.connect(borrower).transfer(borrower.address, 0); // Reset to ensure known state
+      // Transfer away most of borrower's tokens to create insufficient balance
       const userBalance = await usd.balanceOf(borrower.address);
+      await usd.connect(borrower).transfer(owner.address, userBalance - ethers.parseEther("5000")); // Leave only 5k
+      
+      // Approve the full debt amount
       await usd
         .connect(borrower)
-        .approve(await protocol.getAddress(), userBalance + 1n);
+        .approve(await protocol.getAddress(), ethers.parseEther("30000"));
+      
+      // Try to repay more than balance (but less than debt)
       await expect(
-        protocol.connect(borrower).repay(userBalance + 1n)
-      ).to.be.revertedWithCustomError(protocol, "TransferFailed");
+        protocol.connect(borrower).repay(ethers.parseEther("10000"))
+      ).to.be.revertedWithCustomError(usd, "ERC20InsufficientBalance");
     });
 
     it("Should handle liquidation transfer failures", async function () {
@@ -447,7 +453,7 @@ describe("BTCLendingProtocol", function () {
       await usd.connect(liquidator).approve(await protocol.getAddress(), 0);
       await expect(
         protocol.connect(liquidator).liquidate(borrower.address)
-      ).to.be.revertedWithCustomError(protocol, "DebtTransferFailed");
+      ).to.be.revertedWithCustomError(usd, "ERC20InsufficientAllowance");
     });
   });
 
